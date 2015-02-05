@@ -1,0 +1,431 @@
+#set user pass
+passwd centos
+
+
+####ADD HOSTNAME TO /etc/hosts####
+
+#disable selinux
+setenforce 0
+
+#disable tuned
+tuned-adm off
+
+#disable hw offload
+echo "ethtool -K eth0 tso off" >> /etc/rc.local
+echo "ethtool -K eth0 gso off" >> /etc/rc.local
+echo "ethtool -K eth0 gro off" >> /etc/rc.local
+sh /etc/rc.local
+
+#disable nfs
+systemctl stop nfs
+systemctl disable nfs
+systemctl stop rpcbind
+systemctl disable rpcbind
+
+#turn off root login and kerberos login
+sed -i 's/GSSAPIAuthentication yes/GSSAPIAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+systemctl restart sshd
+
+#install utils
+yum install -y bind-utils telnet traceroute wget
+
+#mysql install 
+yum install -y mariadb-server
+echo "bind-address=127.0.0.1" >> /etc/my.cnf.d/server.cnf
+systemctl enable mariadb
+systemctl start mariadb
+
+#create dbs
+mysql -e 'CREATE DATABASE keystone;'
+mysql -e 'CREATE DATABASE glance;'
+mysql -e 'CREATE DATABASE neutron;'
+mysql -e 'CREATE DATABASE nova;'
+mysql -e 'CREATE DATABASE heat;'
+
+#memcached install
+yum -y install memcached
+systemctl enable memcached
+systemctl start memcached
+
+#rabbitmq install
+rpm -Uvh http://download.fedoraproject.org/pub/epel/7/x86_64/e/epel-release-7-5.noarch.rpm
+yum install -y erlang
+rpm -Uvh http://www.rabbitmq.com/releases/rabbitmq-server/v3.4.3/rabbitmq-server-3.4.3-1.noarch.rpm
+echo "export RABBITMQ_NODENAME=rabbit@localhost
+export RABBITMQ_NODE_IP_ADDRESS=127.0.0.1
+export ERL_EPMD_ADDRESS=127.0.0.1" > /etc/rabbitmq/rabbitmq-env.conf
+systemctl enable rabbitmq-server
+systemctl start rabbitmq-server
+
+#RDO init
+yum install -y https://rdo.fedorapeople.org/rdo-release.rpm
+
+#install openstack clients
+yum -y install python-keystoneclient python-glanceclient python-neutronclient python-novaclient python-heatclient
+
+#keystone install
+yum -y install openstack-keystone
+sed -i 's/^#admin_token=.*/admin_token=adminToken/' /etc/keystone/keystone.conf
+sed -i 's/^#connection=.*/connection=mysql:\/\/root@localhost\/keystone/' /etc/keystone/keystone.conf
+sed -i 's/^#driver=keystone.token.persistence.backends.sql.Token/driver=keystone.token.persistence.backends.memcache_pool.Token/' /etc/keystone/keystone.conf
+sed -i 's/^#provider=.*/provider=keystone.token.providers.uuid.Provider/' /etc/keystone/keystone.conf
+sed -i 's/^#public_workers=.*/public_workers=2/' /etc/keystone/keystone.conf
+sed -i 's/^#admin_workers=.*/admin_workers=2/' /etc/keystone/keystone.conf
+
+#start keystone
+keystone-manage db_sync
+mkdir /var/log/keystone
+touch /var/log/keystone/keystone.log
+chown -R keystone:keystone /var/log/keystone/keystone.log
+systemctl enable openstack-keystone
+systemctl start openstack-keystone
+
+IP_ADDRESS=`ip a | grep -ve "inet6\|127" | grep inet | awk '{print $2}' | sed 's/\/.*//'`
+
+#keystone bootstrap
+export OS_SERVICE_TOKEN=adminToken
+export OS_SERVICE_ENDPOINT=http://$IP_ADDRESS:35357/v2.0
+
+#setup admin user/tenant and role
+keystone role-create --name admin
+keystone tenant-create --name admin
+keystone user-create --name admin --tenant admin --pass admin
+keystone user-role-add --user admin --tenant admin --role admin
+
+#create service tenant
+keystone tenant-create --name service
+
+#keystone service/endpoint creation
+keystone service-create --name keystone --type identity
+KEYSTONE_SERVICE_ID=`keystone service-get keystone | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $KEYSTONE_SERVICE_ID --publicurl http://$IP_ADDRESS:5000/v2.0 --internalurl http://$IP_ADDRESS:5000/v2.0 --adminurl http://127.0.0.1:35357/v2.0
+
+#keystone user and endpoint created, now lets use it
+export OS_SERVICE_TOKEN=
+export OS_SERVICE_ENDPOINT=
+echo "export OS_USERNAME=admin" >> /root/openrc
+echo "export OS_TENANT_NAME=admin" >> /root/openrc
+echo "export OS_PASSWORD=admin" >> /root/openrc
+echo "export OS_AUTH_URL=http://$IP_ADDRESS:5000/v2.0" >> /root/openrc
+. /root/openrc
+
+sed -i 's/admin_token_auth //' /usr/share/keystone/keystone-dist-paste.ini
+systemctl restart openstack-keystone
+
+#setup glance keystone 
+keystone user-create --name glance --tenant service --pass glance
+keystone user-role-add --user glance --tenant service --role admin
+keystone service-create --name glance --type image
+GLANCE_SERVICE_ID=`keystone service-get glance | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $GLANCE_SERVICE_ID --publicurl http://$IP_ADDRESS:9292 --internalurl http://$IP_ADDRESS:9292 --adminurl http://127.0.0.1:9292
+
+#setup neutron keystone 
+keystone user-create --name neutron --tenant service --pass neutron
+keystone user-role-add --user neutron --tenant service --role admin
+keystone service-create --name neutron --type network
+NEUTRON_SERVICE_ID=`keystone service-get neutron | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $NEUTRON_SERVICE_ID --publicurl http://$IP_ADDRESS:9696 --internalurl http://$IP_ADDRESS:9696 --adminurl http://127.0.0.1:9696
+
+#setup nova keystone 
+keystone user-create --name nova --tenant service --pass nova
+keystone user-role-add --user nova --tenant service --role admin
+keystone service-create --name nova --type compute
+NOVA_SERVICE_ID=`keystone service-get nova | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $NOVA_SERVICE_ID --publicurl http://$IP_ADDRESS:8774/v2/\$\(tenant_id\)s --internalurl http://$IP_ADDRESS:8774/v2/\$\(tenant_id\)s --adminurl http://127.0.0.1:8774/v2/\$\(tenant_id\)s
+
+#setup heat keystone 
+keystone user-create --name heat --tenant service --pass heat
+keystone user-role-add --user heat --tenant service --role admin
+keystone service-create --name heat --type orchestration
+HEAT_SERVICE_ID=`keystone service-get heat | grep id | awk '{print $4}' | head -1 `
+keystone endpoint-create --service-id $HEAT_SERVICE_ID --publicurl http://$IP_ADDRESS:8004/v1/%\(tenant_id\)s --internalurl http://$IP_ADDRESS:8004/v1/%\(tenant_id\)s --adminurl http://127.0.0.1:8004/v1/%\(tenant_id\)s
+
+#create regular user
+keystone tenant-create --name testtenant
+keystone user-create --name testuser --tenant testtenant --pass test
+echo "export OS_USERNAME=testuser" >> /root/testrc
+echo "export OS_TENANT_NAME=testtenant" >> /root/testrc
+echo "export OS_PASSWORD=test" >> /root/testrc
+echo "export OS_AUTH_URL=http://$IP_ADDRESS:5000/v2.0" >> /root/testrc
+
+#glance install
+yum -y install openstack-glance
+
+#configure glance api
+sed -i 's/^#connection=.*/connection=mysql:\/\/root@localhost\/glance/' /etc/glance/glance-api.conf
+sed -i 's/^#workers=.*/workers=1/' /etc/glance/glance-api.conf
+sed -i 's/^#flavor=.*/flavor=keystone/' /etc/glance/glance-api.conf
+sed -i 's/^#stores=.*/stores=glance.store.filesystem.Store/' /etc/glance/glance-api.conf
+sed -i '/^\[keystone_authtoken\]/a \
+identity_uri=http://127.0.0.1:35357 \
+admin_tenant_name=service \
+admin_user=glance \ 
+admin_password=glance' /etc/glance/glance-api.conf
+
+#configure glance registry
+sed -i 's/^#connection=.*/connection=mysql:\/\/root@localhost\/glance/' /etc/glance/glance-registry.conf
+sed -i 's/^#workers=.*/workers=1/' /etc/glance/glance-registry.conf
+sed -i 's/^#flavor=.*/flavor=keystone/' /etc/glance/glance-registry.conf
+sed -i '/^\[keystone_authtoken\]/a \
+identity_uri=http://127.0.0.1:35357 \
+admin_tenant_name=service \
+admin_user=glance \ 
+admin_password=glance' /etc/glance/glance-registry.conf
+
+#init glance db
+glance-manage db_sync
+
+#glance setup
+mkdir -p /var/log/glance
+touch /var/log/glance/api.log
+touch /var/log/glance/registry.log
+chown -R glance:glance /var/log/glance
+chown -R glance:glance /var/lib/glance
+
+#start glance api
+systemctl enable openstack-glance-api
+systemctl start openstack-glance-api
+
+#start glance registry
+systemctl enable openstack-glance-registry
+systemctl start openstack-glance-registry
+
+#neutron install
+yum -y install openstack-neutron-openvswitch openstack-neutron-ml2 openstack-neutron
+
+#config neutron 
+SERVICE_TENANT_ID=`keystone tenant-get service | grep id | awk '{print $4}'`
+
+echo "[DEFAULT]
+rpc_backend = rabbit
+auth_strategy = keystone
+core_plugin = ml2
+service_plugins=router
+notify_nova_on_port_status_changes=True
+notify_nova_on_port_data_changes=True
+nova_url=http://127.0.0.1:8774/v2
+nova_admin_username=nova
+nova_admin_tenant_id=$SERVICE_TENANT_ID
+nova_admin_password=nova
+nova_admin_auth_url=http://127.0.0.1:35357/v2.0
+[keystone_authtoken]
+auth_uri=http://$IP_ADDRESS:5000/v2.0
+identity_uri=http://127.0.0.1:35357
+admin_tenant_name=service
+admin_user=neutron
+admin_password=neutron
+memcached_servers=localhost:11211
+[database]
+connection=mysql://root@127.0.0.1:3306/neutron
+" > /etc/neutron/neutron.conf
+
+#neutron db init
+neutron-db-manage --config-file /etc/neutron/neutron.conf upgrade juno
+
+#set ml2 as plugin to use
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+#bugfix centos pkging issue with openvswitch agent
+cp /usr/lib/systemd/system/neutron-openvswitch-agent.service /usr/lib/systemd/system/neutron-openvswitch-agent.service.orig
+sed -i 's,plugins/openvswitch/ovs_neutron_plugin.ini,plugin.ini,g' /usr/lib/systemd/system/neutron-openvswitch-agent.service
+
+#configure ml2 with ovs+gre
+echo "[ml2]
+type_drivers = flat,gre
+tenant_network_types = gre
+mechanism_drivers = openvswitch
+[ml2_type_gre]
+tunnel_id_ranges = 1:1000
+[securitygroup]
+enable_security_group = True
+enable_ipset = True
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+[ovs]
+local_ip = $IP_ADDRESS
+enable_tunneling = True
+bridge_mappings = external:br-ex
+[agent]
+tunnel_types=gre" > /etc/neutron/plugin.ini
+
+#start neutron server
+systemctl enable neutron-server
+systemctl start neutron-server
+
+#start openvswitch
+systemctl enable openvswitch
+systemctl start openvswitch
+
+#add bridges
+ovs-vsctl add-br br-int
+ovs-vsctl add-br br-tun
+ovs-vsctl add-br br-ex
+
+#start ovs agent
+systemctl enable neutron-openvswitch-agent
+systemctl start neutron-openvswitch-agent
+
+#configure dhcp agent
+echo "[DEFAULT]
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver" > /etc/neutron/dhcp_agent.ini
+
+#start dhcp agent
+systemctl enable neutron-dhcp-agent
+systemctl start neutron-dhcp-agent
+
+#configure l3 agent
+echo "[DEFAULT]
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver " > /etc/neutron/l3_agent.ini
+
+#start l3 agent
+systemctl enable neutron-l3-agent
+systemctl start neutron-l3-agent
+
+echo "[DEFAULT]
+auth_url = http://$IP_ADDRESS:5000/v2.0
+admin_tenant_name = service
+admin_user = neutron
+admin_password = neutron
+metadata_proxy_shared_secret=123
+metadata_workers=1" > /etc/neutron/metadata_agent.ini
+
+systemctl enable neutron-metadata-agent
+systemctl start neutron-metadata-agent
+
+
+#update kernel to add nbd support
+#http://wiki.centos.org/HowTos/BuildingKernelModules
+yum groupinstall "Development Tools"
+yum -y install rpmdevtools xmlto asciidoc hmaccalc pesign elfutils-devel zlib-devel binutils-devel zlib-devel newt-devel python-devel perl\(ExtUtils::Embed\) audit-libs-devel numactl-devel pciutils-devel bison
+yumdownloader --source kernel
+yum-builddep /root/kernel*.rpm
+rpm -ivh /root/kernel*.rpm
+cd /root/rpmbuild/SPECS
+rpmdev-setuptree
+rpmbuild -bp kernel.spec
+cd /root/rpmbuild/BUILD/kernel*/linux*/
+cp -f /boot/config* .config
+sed -i 's/^# CONFIG_BLK_DEV_NBD.*/CONFIG_BLK_DEV_NBD=m/' .config
+cp /boot/symvers-`uname -r`.gz .
+gunzip ./symvers-`uname-r`.gz 
+mv ./symvers-`uname -r` Module.symvers
+make prepare && make modules_prepare && make M=drivers/block
+strip --strip-debug drivers/block/nbd.ko
+cp drivers/block/nbd.ko /lib/modules/`uname -r`/extra
+depmod -a
+modprobe nbd
+
+#nova install
+yum -y install openstack-nova-api openstack-nova-conductor openstack-nova-scheduler openstack-nova-compute libvirt-daemon-driver-lxc libvirt-daemon-lxc lxc nbd libvirt-daemon-config-nwfilter libvirt-daemon-driver-nwfilter
+
+#start libvirtd
+systemctl enable libvirtd
+systemctl start libvirtd
+
+#configure nova
+echo "[DEFAULT]
+osapi_compute_workers=1
+enabled_apis=osapi_compute
+rpc_backend = rabbit
+auth_strategy = keystone
+my_ip=$IP_ADDRESS
+network_api_class = nova.network.neutronv2.api.API
+security_group_api = neutron
+linuxnet_interface_driver = nova.network.linux_net.LinuxOVSInterfaceDriver
+firewall_driver = nova.virt.firewall.NoopFirewallDriver
+[database]
+connection = mysql://root@localhost/nova
+[keystone_authtoken]
+auth_uri = http://$IP_ADDRESS:5000/v2.0
+identity_uri = http://127.0.0.1:35357
+admin_tenant_name = service
+admin_user = nova
+admin_password = nova
+[glance]
+host=$IP_ADDRESS
+[libvirt]
+virt_type=lxc
+use_virtio_for_bridges=False
+images_type=raw
+[neutron]
+url = http://$IP_ADDRESS:9696
+auth_strategy = keystone
+admin_auth_url = http://127.0.0.1:35357/v2.0
+admin_tenant_name = service
+admin_username = neutron
+admin_password = neutron
+service_metadata_proxy = True
+metadata_proxy_shared_secret = 123
+[conductor]
+workers=1" > /etc/nova/nova.conf
+
+#nova db init
+nova-manage db sync
+
+#start nova api
+systemctl enable openstack-nova-api
+systemctl start openstack-nova-api
+
+#start nova conductor
+systemctl enable openstack-nova-conductor
+systemctl start openstack-nova-conductor
+
+#start nova scheduler
+systemctl enable openstack-nova-scheduler
+systemctl start openstack-nova-scheduler
+
+#start nova compute
+systemctl enable openstack-nova-compute
+systemctl start openstack-nova-compute
+
+#heat install
+yum -y install openstack-heat-api openstack-heat-engine
+
+#heat configure
+echo "[DEFAULT]
+host=`hostname`
+instance_user=heat
+rpc_backend=rabbit
+[database]
+connection=mysql://root@localhost/heat
+[keystone_authtoken]
+auth_uri = http://$IP_ADDRESS:5000/v2.0
+identity_uri = http://127.0.0.1:35357
+admin_tenant_name = service
+admin_user = heat
+admin_password = heat
+auth_version=v2.0
+memcached_servers=localhost:11211
+[revision]
+heat_revision=2014.2.1-1.el7.centos" > /etc/heat/heat.conf
+
+#heat db init
+heat-manage db_sync
+
+#start heat api
+systemctl enable openstack-heat-api
+systemctl start openstack-heat-api
+
+#start heat engine
+systemctl enable openstack-heat-engine
+systemctl start openstack-heat-engine
+
+#get cirros
+cd /root
+wget http://download.cirros-cloud.net/0.3.3/cirros-0.3.3-x86_64-rootfs.img.gz
+gunzip /root/cirros*.gz
+
+. /root/testrc
+
+#upload cirros
+glance image-create --name cirros --disk-format raw --container-format bare < /root/cirros*rootfs.img
+
+#create l2 network
+neutron net-create test
+neutron subnet-create test 192.168.2.0/24
+neutron security-group-rule-create --protocol icmp --remote-ip-prefix 0.0.0.0/0 default
+neutron security-group-rule-create --protocol tcp --port-range-min 22 --port-range-max 22 --remote-ip-prefix 0.0.0.0/0 default
+
+#boot instance
+TEST_NET_ID=`neutron net-list | grep test | awk '{print $2}'`
+nova boot --flavor m1.small --image cirros --security-groups default --nic net-id=$TEST_NET_ID test  --poll
