@@ -1,0 +1,357 @@
+#set user pass
+
+####ADD HOSTNAME TO /etc/hosts####
+
+#disable hw offload
+#echo "ethtool -K eth0 tso off" >> /etc/rc.local
+#echo "ethtool -K eth0 gso off" >> /etc/rc.local
+#echo "ethtool -K eth0 gro off" >> /etc/rc.local
+#sh /etc/rc.local
+
+#mysql install 
+apt-get install -y mariadb-server
+
+#create dbs
+#mysql -e 'CREATE DATABASE keystone;'
+#mysql -e 'CREATE DATABASE glance;'
+#mysql -e 'CREATE DATABASE neutron;'
+#mysql -e 'CREATE DATABASE nova;'
+#mysql -e 'CREATE DATABASE heat;'
+
+#memcached install
+apt-get install -y memcached
+
+#rabbitmq install
+apt-get install -y rabbitmq-server
+#echo "export RABBITMQ_NODENAME=rabbit@localhost
+#export RABBITMQ_NODE_IP_ADDRESS=127.0.0.1
+#export ERL_EPMD_ADDRESS=127.0.0.1" > /etc/rabbitmq/rabbitmq-env.conf
+
+#cloud archive init
+add-apt-repository cloud-archive:juno
+apt-get update
+
+#install openstack clients
+apt-get -y install python-keystoneclient python-glanceclient python-neutronclient python-novaclient python-heatclient
+
+#keystone install
+apt-get -y install keystone
+service keystone stop
+
+echo "[DEFAULT]
+admin_token=adminToken
+public_workers=2
+admin_workers=2
+log_dir=/var/log/keystone
+[database]
+connection=mysql://root@localhost/keystone
+[memcache]
+servers=localhost:11211
+[token]
+provider=keystone.token.providers.uuid.Provider" > /etc/keystone/keystone.conf
+
+#start keystone
+keystone-manage db_sync
+service keystone start
+
+IP_ADDRESS=`ip a | grep -ve "inet6\|127" | grep inet | awk '{print $2}' | sed 's/\/.*//'`
+
+#keystone bootstrap
+export OS_SERVICE_TOKEN=adminToken
+export OS_SERVICE_ENDPOINT=http://$IP_ADDRESS:35357/v2.0
+
+#setup admin user/tenant and role
+keystone role-create --name admin
+keystone tenant-create --name admin
+keystone user-create --name admin --tenant admin --pass admin
+keystone user-role-add --user admin --tenant admin --role admin
+
+#create service tenant
+keystone tenant-create --name service
+
+#keystone service/endpoint creation
+keystone service-create --name keystone --type identity
+KEYSTONE_SERVICE_ID=`keystone service-get keystone | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $KEYSTONE_SERVICE_ID --publicurl http://$IP_ADDRESS:5000/v2.0 --internalurl http://$IP_ADDRESS:5000/v2.0 --adminurl http://$IP_ADDRESS:35357/v2.0
+
+#keystone user and endpoint created, now lets use it
+export OS_SERVICE_TOKEN=
+export OS_SERVICE_ENDPOINT=
+echo "export OS_USERNAME=admin" >> /root/openrc
+echo "export OS_TENANT_NAME=admin" >> /root/openrc
+echo "export OS_PASSWORD=admin" >> /root/openrc
+echo "export OS_AUTH_URL=http://$IP_ADDRESS:5000/v2.0" >> /root/openrc
+. /root/openrc
+
+#setup glance keystone 
+keystone user-create --name glance --tenant service --pass glance
+keystone user-role-add --user glance --tenant service --role admin
+keystone service-create --name glance --type image
+GLANCE_SERVICE_ID=`keystone service-get glance | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $GLANCE_SERVICE_ID --publicurl http://$IP_ADDRESS:9292 --internalurl http://$IP_ADDRESS:9292 --adminurl http://$IP_ADDRESS:9292
+
+#setup neutron keystone 
+keystone user-create --name neutron --tenant service --pass neutron
+keystone user-role-add --user neutron --tenant service --role admin
+keystone service-create --name neutron --type network
+NEUTRON_SERVICE_ID=`keystone service-get neutron | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $NEUTRON_SERVICE_ID --publicurl http://$IP_ADDRESS:9696 --internalurl http://$IP_ADDRESS:9696 --adminurl http://$IP_ADDRESS:9696
+
+#setup nova keystone 
+keystone user-create --name nova --tenant service --pass nova
+keystone user-role-add --user nova --tenant service --role admin
+keystone service-create --name nova --type compute
+NOVA_SERVICE_ID=`keystone service-get nova | grep id | awk '{print $4}' | head -1`
+keystone endpoint-create --service-id $NOVA_SERVICE_ID --publicurl http://$IP_ADDRESS:8774/v2/\$\(tenant_id\)s --internalurl http://$IP_ADDRESS:8774/v2/\$\(tenant_id\)s --adminurl http://$IP_ADDRESS:8774/v2/\$\(tenant_id\)s
+
+#create regular user
+keystone tenant-create --name testtenant
+keystone user-create --name testuser --tenant testtenant --pass test
+echo "export OS_USERNAME=testuser" >> /root/testrc
+echo "export OS_TENANT_NAME=testtenant" >> /root/testrc
+echo "export OS_PASSWORD=test" >> /root/testrc
+echo "export OS_AUTH_URL=http://$IP_ADDRESS:5000/v2.0" >> /root/testrc
+
+#glance install
+apt-get -y install glance
+service glance-api stop
+service glance-registry stop
+
+#configure glance api
+echo "[DEFAULT]
+default_store = file
+bind_host = 0.0.0.0
+bind_port = 9292
+log_file = /var/log/glance/api.log
+backlog = 4096
+registry_host = 0.0.0.0
+registry_port = 9191
+registry_client_protocol = http
+delayed_delete = False
+scrub_time = 43200
+[database]
+backend = sqlalchemy
+connection = mysql://debian-sys-maint:jAeNwefaUaw0e6Mr@localhost/glance
+[keystone_authtoken]
+identity_uri=http://$IP_ADDRESS:35357
+admin_tenant_name=service
+admin_user=glance
+admin_password=glance
+revocation_cache_time = 10
+[paste_deploy]
+flavor=keystone
+[glance_store]
+filesystem_store_datadir = /var/lib/glance/images/" > /etc/glance/glance-api.conf
+
+#configure glance registry
+echo "[DEFAULT]
+bind_host = 0.0.0.0
+bind_port = 9191
+log_file = /var/log/glance/registry.log
+backlog = 4096
+api_limit_max = 1000
+limit_param_default = 25
+[database]
+backend = sqlalchemy
+connection = mysql://root@localhost/glance
+[keystone_authtoken]
+identity_uri = http://$IP_ADDRESS:35357
+admin_tenant_name = service
+admin_user = glance
+admin_password = glance
+[paste_deploy]
+flavor=keystone" > /etc/glance/glance-registry.conf
+
+#init glance db
+glance-manage db_sync
+
+#start glance api
+service glance-api start
+
+#start glance registry
+service glance-registry start
+
+#neutron install
+apt-get -y install neutron-server neutron-plugin-ml2 neutron-plugin-openvswitch neutron-plugin-openvswitch-agent neutron-dhcp-agent neutron-l3-agent
+service neutron-server stop
+service neutron-plugin-openvswitch-agent stop
+service neutron-l3-agent stop
+service neutron-dhcp-agent stop
+service neutron-metadata-agent stop
+
+
+#config neutron 
+SERVICE_TENANT_ID=`keystone tenant-get service | grep id | awk '{print $4}'`
+
+echo "[DEFAULT]
+lock_path=/var/lib/neutron/lock
+rpc_backend = rabbit
+auth_strategy = keystone
+core_plugin = ml2
+service_plugins=router
+notify_nova_on_port_status_changes=True
+notify_nova_on_port_data_changes=True
+nova_url=http://$IP_ADDRESS:8774/v2
+nova_admin_username=nova
+nova_admin_tenant_id=$SERVICE_TENANT_ID
+nova_admin_password=nova
+nova_admin_auth_url=http://$IP_ADDRESS:35357/v2.0
+[keystone_authtoken]
+auth_uri=http://$IP_ADDRESS:5000/v2.0
+identity_uri=http://$IP_ADDRESS:35357
+admin_tenant_name=service
+admin_user=neutron
+admin_password=neutron
+[database]
+connection=mysql://root@localhost/neutron
+[agent]
+root_helper = sudo /usr/bin/neutron-rootwrap /etc/neutron/rootwrap.conf
+" > /etc/neutron/neutron.conf
+
+#neutron db init
+neutron-db-manage --config-file /etc/neutron/neutron.conf upgrade juno
+
+#set ml2 as plugin to use
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+#configure ml2 with ovs+gre
+echo "[ml2]
+type_drivers = flat,gre
+tenant_network_types = gre
+mechanism_drivers = openvswitch
+[ml2_type_gre]
+tunnel_id_ranges = 1:1000
+[securitygroup]
+enable_security_group = True
+enable_ipset = True
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+[ovs]
+local_ip = $IP_ADDRESS
+enable_tunneling = True
+bridge_mappings = external:br-ex
+[agent]
+tunnel_types=gre" > /etc/neutron/plugin.ini
+
+#[ml2]
+#type_drivers = vlan
+#tenant_network_types = vlan
+#mechanism_drivers = openvswitch
+#[ml2_type_vlan]
+#network_vlan_ranges= physnet1:1000:1999,physnet2:2000:2999
+#bridge_mappings = physnet1:br-eth0, physnet2:br-eth1
+#[securitygroup]
+#enable_security_group = True
+#enable_ipset = True
+#firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+#[ovs]
+#local_ip = $IP_ADDRESS
+#enable_tunneling = True
+#network_vlan_ranges= physnet1:1000:1999,physnet2:2000:2999
+#bridge_mappings = physnet1:br-eth0, physnet2:br-eth1
+
+#ovs-vsctl add-br br-eth0
+#ovs-vsctl add-br br-eth1
+#ovs-vsctl add-port br-eth0 eth0
+#ovs-vsctl add-port br-eth1 eth1
+
+#start neutron server
+service neutron-server start
+
+#start ovs agent
+service neutron-plugin-openvswitch-agent start
+
+#configure dhcp agent
+echo "[DEFAULT]
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver" > /etc/neutron/dhcp_agent.ini
+
+#start dhcp agent
+service neutron-dhcp-agent start
+
+#configure l3 agent
+echo "[DEFAULT]
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver " > /etc/neutron/l3_agent.ini
+
+#start l3 agent
+service neutron-l3-agent start
+
+#nova install
+apt-get -y install nova-api nova-conductor nova-scheduler nova-compute
+
+service nova-api stop
+service nova-conductor stop
+service nova-scheduler stop
+service nova-compute stop
+
+rm /etc/nova/nova-compute.conf
+ln -s /etc/nova/nova.conf /etc/nova/nova-compute.conf
+
+#configure nova
+echo "[DEFAULT]
+force_config_drive=true
+compute_driver=libvirt.LibvirtDriver
+state_path=/var/lib/nova
+osapi_compute_workers=1
+enabled_apis=osapi_compute
+rpc_backend = rabbit
+auth_strategy = keystone
+my_ip=$IP_ADDRESS
+network_api_class = nova.network.neutronv2.api.API
+security_group_api = neutron
+linuxnet_interface_driver = nova.network.linux_net.LinuxOVSInterfaceDriver
+firewall_driver = nova.virt.firewall.NoopFirewallDriver
+[database]
+connection = mysql://root@localhost/nova
+[keystone_authtoken]
+auth_uri = http://$IP_ADDRESS:5000/v2.0
+identity_uri = http://$IP_ADDRESS:35357
+admin_tenant_name = service
+admin_user = nova
+admin_password = nova
+[glance]
+host=$IP_ADDRESS
+[libvirt]
+virt_type=kvm
+[neutron]
+url = http://$IP_ADDRESS:9696
+auth_strategy = keystone
+admin_auth_url = http://$IP_ADDRESS:35357/v2.0
+admin_tenant_name = service
+admin_username = neutron
+admin_password = neutron
+[conductor]
+workers=1" > /etc/nova/nova.conf
+
+#nova db init
+nova-manage db sync
+
+#start nova api
+service nova-api start
+
+#start nova conductor
+service nova-conductor start
+
+#start nova scheduler
+service nova-scheduler start
+
+#start nova compute
+service nova-compute start
+
+#get cirros
+cd /root
+wget http://download.cirros-cloud.net/0.3.3/cirros-0.3.3-x86_64-rootfs.img.gz
+gunzip /root/cirros*.gz
+
+. /root/testrc
+
+#upload cirros
+glance image-create --name cirros --disk-format raw --container-format bare < /root/cirros*rootfs.img
+
+#create l2 network
+neutron net-create test
+neutron subnet-create test 192.168.2.0/24
+neutron security-group-rule-create --protocol icmp --remote-ip-prefix 0.0.0.0/0 default
+neutron security-group-rule-create --protocol tcp --port-range-min 22 --port-range-max 22 --remote-ip-prefix 0.0.0.0/0 default
+
+#boot instance
+TEST_NET_ID=`neutron net-list | grep test | awk '{print $2}'`
+nova boot --flavor m1.small --image cirros --security-groups default --nic net-id=$TEST_NET_ID test  --poll
